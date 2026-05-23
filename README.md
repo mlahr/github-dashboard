@@ -86,7 +86,7 @@ Configuration is stored in the browser's `localStorage`.
 | Setting | Description | Default |
 | --- | --- | --- |
 | GitHub token | Token used for GitHub API requests | Empty |
-| Repository patterns | Glob patterns used to discover repositories | `MenschMachine/pdfdancer-client-*` |
+| Repository patterns | Glob patterns used to discover repositories | Empty |
 | Repos cache TTL | How long repository discovery results are cached | 5 minutes |
 | Runs cache TTL | How long workflow run results are cached | 2 minutes |
 | PRs cache TTL | How long pull request and review results are cached | 2 minutes |
@@ -158,4 +158,4 @@ The `example-data/` directory contains a sample snapshot of GitHub Actions data.
 
 ## License
 
-No license file is currently included. Add a license before publishing if you want others to use, modify, or redistribute the project.
+MIT. See [LICENSE](LICENSE).
