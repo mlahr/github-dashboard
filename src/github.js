@@ -1,6 +1,61 @@
 import { Octokit } from '@octokit/rest';
 import picomatch from 'picomatch';
 
+const REPOSITORY_CACHE_KEY = 'gh-cache-repositories-v2';
+const REPOSITORY_CACHE_VERSION = 2;
+
+function createEmptyRepositoryCache() {
+  return { version: REPOSITORY_CACHE_VERSION, entries: {} };
+}
+
+function removeLegacyRepositoryCacheEntries() {
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key?.startsWith('gh-cache-repos-')) keys.push(key);
+  }
+  keys.forEach(key => localStorage.removeItem(key));
+}
+
+function readRepositoryCache() {
+  removeLegacyRepositoryCacheEntries();
+
+  try {
+    const raw = localStorage.getItem(REPOSITORY_CACHE_KEY);
+    if (!raw) return createEmptyRepositoryCache();
+
+    const cache = JSON.parse(raw);
+    if (
+      cache?.version !== REPOSITORY_CACHE_VERSION ||
+      !cache.entries ||
+      typeof cache.entries !== 'object' ||
+      Array.isArray(cache.entries)
+    ) {
+      return createEmptyRepositoryCache();
+    }
+    return cache;
+  } catch {
+    return createEmptyRepositoryCache();
+  }
+}
+
+async function cachedRepositoryResolution(key, ttlMs, fetchFn) {
+  const cached = readRepositoryCache().entries[key];
+  if (cached && Date.now() - cached.timestamp < ttlMs) {
+    return cached.data;
+  }
+
+  const data = await fetchFn();
+  try {
+    const cache = readRepositoryCache();
+    cache.entries[key] = { data, timestamp: Date.now() };
+    localStorage.setItem(REPOSITORY_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // storage full — still return the data, just skip caching
+  }
+  return data;
+}
+
 async function cachedFetch(key, ttlMs, fetchFn) {
   try {
     const raw = localStorage.getItem(key);
@@ -43,6 +98,64 @@ function mapRepository(repo) {
   };
 }
 
+function parseRepositoryPatterns(patterns) {
+  const exact = [];
+  const wildcardByOwner = new Map();
+  const warnings = [];
+
+  for (const pattern of patterns) {
+    const firstSlash = pattern.indexOf('/');
+    const hasOneSlash = firstSlash > 0 && firstSlash === pattern.lastIndexOf('/');
+    if (!hasOneSlash || firstSlash === pattern.length - 1) {
+      warnings.push({
+        target: pattern,
+        status: null,
+        message: 'Expected owner/repository with exactly one slash.',
+      });
+      continue;
+    }
+
+    const owner = pattern.slice(0, firstSlash);
+    const repositoryPattern = pattern.slice(firstSlash + 1);
+    if (picomatch.scan(owner).isGlob) {
+      warnings.push({
+        target: pattern,
+        status: null,
+        message: 'The owner segment must be a literal GitHub login.',
+      });
+      continue;
+    }
+
+    if (!picomatch.scan(repositoryPattern).isGlob) {
+      exact.push({ owner, repository: repositoryPattern, pattern });
+      continue;
+    }
+
+    const ownerKey = owner.toLowerCase();
+    const group = wildcardByOwner.get(ownerKey) || { owner, patterns: [] };
+    group.patterns.push(pattern);
+    wildcardByOwner.set(ownerKey, group);
+  }
+
+  return { exact, wildcardByOwner, warnings };
+}
+
+function warningFor(target, error) {
+  return {
+    target,
+    status: error.status || error.response?.status || null,
+    message: error.message || 'Repository resolution failed.',
+  };
+}
+
+function deduplicateRepositories(repositories) {
+  const byFullName = new Map();
+  for (const repository of repositories) {
+    byFullName.set(repository.full_name.toLowerCase(), repository);
+  }
+  return [...byFullName.values()];
+}
+
 function mapRepositoryData(repo, runsData, prsData) {
   return {
     name: repo.full_name,
@@ -67,27 +180,125 @@ function mapRepositoryData(repo, runsData, prsData) {
   };
 }
 
-export function createDashboardClient(token) {
-  const octokit = new Octokit({ auth: token });
+export function createDashboardClient(token, octokitOverride) {
+  const octokit = octokitOverride || new Octokit({ auth: token });
 
   return {
     async fetchMatchedRepositories(patterns, { reposTtl = 5 * 60 * 1000 } = {}) {
-      const orgs = [...new Set(patterns.map(p => p.split('/')[0]))];
+      const { exact, wildcardByOwner, warnings } = parseRepositoryPatterns(patterns);
+      const repositories = [];
 
-      const allRepos = [];
-      for (const org of orgs) {
-        const repos = await cachedFetch(`gh-cache-repos-${org}`, reposTtl, async () => {
-          const raw = await octokit.paginate(octokit.repos.listForOrg, {
-            org,
-            per_page: 100,
+      const exactResults = await Promise.allSettled(exact.map(async item => {
+        const key = `repository:${item.owner}/${item.repository}`.toLowerCase();
+        return cachedRepositoryResolution(key, reposTtl, async () => {
+          const { data } = await octokit.repos.get({
+            owner: item.owner,
+            repo: item.repository,
           });
-          return raw.map(mapRepository);
+          return mapRepository(data);
         });
-        allRepos.push(...repos);
-      }
+      }));
 
-      const isMatch = picomatch(patterns);
-      return allRepos.filter(repo => isMatch(repo.full_name));
+      exactResults.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          repositories.push(result.value);
+        } else {
+          warnings.push(warningFor(exact[index].pattern, result.reason));
+        }
+      });
+
+      let authenticatedInventoryPromise;
+      const getAuthenticatedInventory = () => {
+        if (!authenticatedInventoryPromise) {
+          authenticatedInventoryPromise = cachedRepositoryResolution(
+            'inventory:authenticated',
+            reposTtl,
+            async () => {
+              const raw = await octokit.paginate(octokit.repos.listForAuthenticatedUser, {
+                per_page: 100,
+              });
+              return raw.map(mapRepository);
+            }
+          );
+        }
+        return authenticatedInventoryPromise;
+      };
+
+      const wildcardGroups = [...wildcardByOwner.values()];
+      const wildcardResults = await Promise.allSettled(wildcardGroups.map(async group => {
+        const ownerKey = group.owner.toLowerCase();
+        const account = await cachedRepositoryResolution(
+          `owner:${ownerKey}`,
+          reposTtl,
+          async () => {
+            const { data } = await octokit.users.getByUsername({ username: group.owner });
+            return { login: data.login, type: data.type };
+          }
+        );
+        const matcher = picomatch(group.patterns, { nocase: true });
+
+        if (account.type === 'Organization') {
+          const inventory = await cachedRepositoryResolution(
+            `inventory:organization:${account.login.toLowerCase()}`,
+            reposTtl,
+            async () => {
+              const raw = await octokit.paginate(octokit.repos.listForOrg, {
+                org: account.login,
+                per_page: 100,
+              });
+              return raw.map(mapRepository);
+            }
+          );
+          return { repositories: inventory.filter(repo => matcher(repo.full_name)), warnings: [] };
+        }
+
+        const [publicResult, authenticatedResult] = await Promise.allSettled([
+          cachedRepositoryResolution(
+            `inventory:user:${account.login.toLowerCase()}`,
+            reposTtl,
+            async () => {
+              const raw = await octokit.paginate(octokit.repos.listForUser, {
+                username: account.login,
+                type: 'owner',
+                per_page: 100,
+              });
+              return raw.map(mapRepository);
+            }
+          ),
+          getAuthenticatedInventory(),
+        ]);
+
+        const discovered = [];
+        const groupWarnings = [];
+        if (publicResult.status === 'fulfilled') {
+          discovered.push(...publicResult.value);
+        } else {
+          groupWarnings.push(warningFor(`${account.login} public repositories`, publicResult.reason));
+        }
+        if (authenticatedResult.status === 'fulfilled') {
+          discovered.push(...authenticatedResult.value.filter(repo =>
+            repo.owner.login.toLowerCase() === account.login.toLowerCase()
+          ));
+        } else {
+          groupWarnings.push(warningFor(`${account.login} accessible private repositories`, authenticatedResult.reason));
+        }
+
+        return {
+          repositories: deduplicateRepositories(discovered).filter(repo => matcher(repo.full_name)),
+          warnings: groupWarnings,
+        };
+      }));
+
+      wildcardResults.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          repositories.push(...result.value.repositories);
+          warnings.push(...result.value.warnings);
+        } else {
+          warnings.push(warningFor(wildcardGroups[index].owner, result.reason));
+        }
+      });
+
+      return { repositories: deduplicateRepositories(repositories), warnings };
     },
 
     async fetchRepositoryData(repo, { runsTtl = 2 * 60 * 1000, prsTtl = 2 * 60 * 1000 } = {}) {

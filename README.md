@@ -7,7 +7,7 @@ The app lets you enter one or more repository patterns, discovers matching repos
 ## Features
 
 - Monitor many repositories from a single dashboard
-- Match repositories with glob patterns such as `my-org/service-*`
+- Match organization-owned or user-owned repositories with glob patterns such as `my-org/service-*`
 - Show the latest GitHub Actions workflow runs for each repository
 - Highlight recent successes, failures, in-progress runs, and other states
 - Show open pull requests per repository
@@ -70,7 +70,7 @@ The dashboard runs entirely in the browser and calls the GitHub API directly thr
 
 For public repositories, a fine-grained token with read access to repository metadata, Actions, and pull requests is usually enough.
 
-For private repositories, grant the token read access to the repositories you want to monitor. Depending on your organization settings, you may also need organization read access so the app can list repositories in the organization.
+For private repositories, grant the token read access to the repositories you want to monitor. Depending on your organization settings, you may also need organization read access so the app can list repositories in the organization. User-account wildcard patterns combine the user's public repositories with private repositories accessible to the configured token.
 
 The app uses these GitHub API capabilities:
 
@@ -95,7 +95,7 @@ Use the refresh button in the dashboard to clear cached GitHub API responses and
 
 ## Repository Pattern Matching
 
-Patterns are matched against full repository names in `owner/repo` format.
+Patterns are matched case-insensitively against full repository names in `owner/repo` format. The owner must be a literal GitHub organization or user login. The repository portion may be an exact name or a glob.
 
 Examples:
 
@@ -104,9 +104,14 @@ my-org/*
 my-org/web-*
 my-org/service-api
 my-org/*-client
+octocat/Hello-World
 ```
 
 Multiple patterns can be entered on separate lines.
+
+Glob characters retain their normal meaning: `my-org/service-*` matches names beginning with `service-`, but it does not match a repository named exactly `service`. Use `my-org/service*` when both forms should match.
+
+Exact repository lookups, owner types, and repository inventories share one browser cache controlled by **Repos Cache TTL**. The refresh button clears this repository cache and forces fresh GitHub API requests.
 
 ## Available Scripts
 

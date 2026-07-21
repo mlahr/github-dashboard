@@ -31,6 +31,12 @@ function getErrorMessage(err) {
   return err.message;
 }
 
+function formatDiscoveryWarnings(warnings) {
+  return warnings
+    .map(warning => `${warning.target}: ${getErrorMessage(warning)}`)
+    .join('; ');
+}
+
 function getLatestWorkflowRun(repo) {
   if (!repo.workflow_runs || repo.workflow_runs.length === 0) {
     return null;
@@ -142,6 +148,7 @@ export default function Dashboard() {
   const [discovering, setDiscovering] = useState(() => !!localStorage.getItem(LS_TOKEN_KEY));
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const [discoveryWarnings, setDiscoveryWarnings] = useState([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [token, setToken] = useState(() => localStorage.getItem(LS_TOKEN_KEY) || '');
@@ -196,18 +203,21 @@ export default function Dashboard() {
     };
 
     setError(null);
+    setDiscoveryWarnings([]);
     setDiscovering(!hasExistingResults);
     setRefreshing(hasExistingResults);
 
     client.fetchMatchedRepositories(patterns, ttlOptions)
-      .then(matchedRepos => {
+      .then(({ repositories: matchedRepos, warnings }) => {
         if (cancelled) return;
 
+        setDiscoveryWarnings(warnings);
         setMatchedRepoCount(matchedRepos.length);
         setRepositories(prev => mergeRepositoriesWithMatches(prev, matchedRepos));
         setDiscovering(false);
 
         if (matchedRepos.length === 0) {
+          if (warnings.length > 0) setSettingsOpen(true);
           setRefreshing(false);
           return;
         }
@@ -307,7 +317,9 @@ export default function Dashboard() {
     localStorage.setItem(LS_REPOS_TTL_KEY, draftReposTtl);
     localStorage.setItem(LS_RUNS_TTL_KEY, draftRunsTtl);
     localStorage.setItem(LS_PRS_TTL_KEY, draftPrsTtl);
+    if (draftToken !== token) clearCache();
     setError(null);
+    setDiscoveryWarnings([]);
     if (!draftToken) {
       setRepositories([]);
       setMatchedRepoCount(0);
@@ -325,6 +337,7 @@ export default function Dashboard() {
   function handleRefresh() {
     clearCache();
     setError(null);
+    setDiscoveryWarnings([]);
     setRefreshCounter(c => c + 1);
   }
 
@@ -423,12 +436,14 @@ export default function Dashboard() {
     );
   }
 
-  if (error && !hasRenderedResults) {
+  if ((error || discoveryWarnings.length > 0) && !hasRenderedResults) {
     return (
       <div className="dashboard">
         <section className="dashboard-hero elevated-section">
           {headerRow}
-          <div className="error">Error: {error}</div>
+          <div className="error">
+            Error: {error || formatDiscoveryWarnings(discoveryWarnings)}
+          </div>
         </section>
         {settingsOpen && settingsPanel}
       </div>
@@ -459,6 +474,11 @@ export default function Dashboard() {
         {headerRow}
         {error && (
           <div className="error dashboard-inline-error">Error: {error}</div>
+        )}
+        {discoveryWarnings.length > 0 && (
+          <div className="error dashboard-inline-error">
+            Warning: {formatDiscoveryWarnings(discoveryWarnings)}
+          </div>
         )}
         <div className="dashboard-hero-stats">
           <StatsBar failed={failed} other={other} />
