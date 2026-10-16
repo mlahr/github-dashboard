@@ -204,7 +204,15 @@ function mapPrs(prsData) {
 }
 
 export function createDashboardClient(token, octokitOverride) {
-  const octokit = octokitOverride || new Octokit({ auth: token });
+  // GitHub answers with "cache-control: max-age=60". Without "no-cache", the browser can return
+  // an old response for up to 60 seconds, even after our own cache was cleared. "no-cache" makes
+  // the browser ask GitHub whether the data changed (ETag), so refresh and polling see new runs.
+  const octokit = octokitOverride || new Octokit({
+    auth: token,
+    request: {
+      fetch: (url, options) => globalThis.fetch(url, { ...options, cache: 'no-cache' }),
+    },
+  });
 
   const client = {
     async fetchMatchedRepositories(patterns, { reposTtl = 5 * 60 * 1000 } = {}) {
