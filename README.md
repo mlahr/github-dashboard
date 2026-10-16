@@ -111,7 +111,7 @@ Multiple patterns can be entered on separate lines.
 
 Glob characters retain their normal meaning: `my-org/service-*` matches names beginning with `service-`, but it does not match a repository named exactly `service`. Use `my-org/service*` when both forms should match.
 
-Exact repository lookups, owner types, and repository inventories share one browser cache controlled by **Repos Cache TTL**. The refresh button clears this repository cache and forces fresh GitHub API requests.
+Exact `owner/repo` patterns are resolved locally without an API call; a missing repository surfaces as an error on its card. Owner types and repository inventories for wildcard patterns are cached in the browser under **Repos Cache TTL**. The refresh button clears these caches and forces fresh GitHub API requests.
 
 ## Available Scripts
 

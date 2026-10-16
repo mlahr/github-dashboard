@@ -77,6 +77,29 @@ async function cachedFetch(key, ttlMs, fetchFn) {
   return data;
 }
 
+// GitHub names are case-insensitive, so cache keys use the lowercase name.
+// "Owner/Repo" and "owner/repo" then share one entry.
+function repoCacheKey(kind, fullName) {
+  return `gh-cache-${kind}-${fullName.toLowerCase()}`;
+}
+
+// Reads a cache entry without a TTL check. Removes an entry that cannot be read or mapped,
+// so the same bad entry does not fail again on the next refresh.
+function readStaleCacheEntry(key, mapFn) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return undefined;
+    return mapFn(JSON.parse(raw).data);
+  } catch {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // storage not available — nothing more to do
+    }
+    return undefined;
+  }
+}
+
 export function clearCache() {
   const keys = [];
   for (let i = 0; i < localStorage.length; i++) {
@@ -87,7 +110,7 @@ export function clearCache() {
 }
 
 export function clearRunsCache(repoFullName) {
-  localStorage.removeItem(`gh-cache-runs-${repoFullName}`);
+  localStorage.removeItem(repoCacheKey('runs', repoFullName));
 }
 
 function mapRepository(repo) {
@@ -156,56 +179,47 @@ function deduplicateRepositories(repositories) {
   return [...byFullName.values()];
 }
 
-function mapRepositoryData(repo, runsData, prsData) {
-  return {
-    name: repo.full_name,
-    workflow_runs: runsData.workflow_runs.map(run => ({
-      run_id: run.id,
-      name: run.name,
-      conclusion: run.conclusion,
-      status: run.status,
-      created_at: run.created_at,
-      html_url: run.html_url,
-    })),
-    open_prs: prsData.map(pr => ({
-      number: pr.number,
-      title: pr.title,
-      user: pr.user?.login,
-      created_at: pr.created_at,
-      updated_at: pr.updated_at,
-      html_url: pr.html_url,
-      draft: pr.draft,
-      labels: pr.labels?.map(l => ({ name: l.name, color: l.color })) || [],
-    })),
-  };
+function mapRuns(runsData) {
+  return runsData.workflow_runs.map(run => ({
+    run_id: run.id,
+    name: run.name,
+    conclusion: run.conclusion,
+    status: run.status,
+    created_at: run.created_at,
+    html_url: run.html_url,
+  }));
+}
+
+function mapPrs(prsData) {
+  return prsData.map(pr => ({
+    number: pr.number,
+    title: pr.title,
+    user: pr.user?.login,
+    created_at: pr.created_at,
+    updated_at: pr.updated_at,
+    html_url: pr.html_url,
+    draft: pr.draft,
+    labels: pr.labels?.map(l => ({ name: l.name, color: l.color })) || [],
+  }));
 }
 
 export function createDashboardClient(token, octokitOverride) {
   const octokit = octokitOverride || new Octokit({ auth: token });
 
-  return {
+  const client = {
     async fetchMatchedRepositories(patterns, { reposTtl = 5 * 60 * 1000 } = {}) {
       const { exact, wildcardByOwner, warnings } = parseRepositoryPatterns(patterns);
       const repositories = [];
 
-      const exactResults = await Promise.allSettled(exact.map(async item => {
-        const key = `repository:${item.owner}/${item.repository}`.toLowerCase();
-        return cachedRepositoryResolution(key, reposTtl, async () => {
-          const { data } = await octokit.repos.get({
-            owner: item.owner,
-            repo: item.repository,
-          });
-          return mapRepository(data);
+      // Exact patterns already contain the full name — resolve locally, no API call.
+      // A missing repo surfaces later as an error card on its workflow-runs fetch.
+      for (const item of exact) {
+        repositories.push({
+          full_name: `${item.owner}/${item.repository}`,
+          name: item.repository,
+          owner: { login: item.owner },
         });
-      }));
-
-      exactResults.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          repositories.push(result.value);
-        } else {
-          warnings.push(warningFor(exact[index].pattern, result.reason));
-        }
-      });
+      }
 
       let authenticatedInventoryPromise;
       const getAuthenticatedInventory = () => {
@@ -301,8 +315,8 @@ export function createDashboardClient(token, octokitOverride) {
       return { repositories: deduplicateRepositories(repositories), warnings };
     },
 
-    async fetchRepositoryData(repo, { runsTtl = 2 * 60 * 1000, prsTtl = 2 * 60 * 1000 } = {}) {
-      const runsData = await cachedFetch(`gh-cache-runs-${repo.full_name}`, runsTtl, async () => {
+    async fetchRepositoryRuns(repo, { runsTtl = 2 * 60 * 1000 } = {}) {
+      const runsData = await cachedFetch(repoCacheKey('runs', repo.full_name), runsTtl, async () => {
         const { data } = await octokit.actions.listWorkflowRunsForRepo({
           owner: repo.owner.login,
           repo: repo.name,
@@ -311,7 +325,11 @@ export function createDashboardClient(token, octokitOverride) {
         return data;
       });
 
-      const prsData = await cachedFetch(`gh-cache-prs-${repo.full_name}`, prsTtl, async () => {
+      return { name: repo.full_name, workflow_runs: mapRuns(runsData) };
+    },
+
+    async fetchRepositoryPrs(repo, { prsTtl = 2 * 60 * 1000 } = {}) {
+      const prsData = await cachedFetch(repoCacheKey('prs', repo.full_name), prsTtl, async () => {
         const { data } = await octokit.pulls.list({
           owner: repo.owner.login,
           repo: repo.name,
@@ -323,12 +341,32 @@ export function createDashboardClient(token, octokitOverride) {
         return data;
       });
 
-      return mapRepositoryData(repo, runsData, prsData);
+      return { open_prs: mapPrs(prsData) };
+    },
+
+    async fetchRepositoryData(repo, options = {}) {
+      const [runs, prs] = await Promise.all([
+        client.fetchRepositoryRuns(repo, options),
+        client.fetchRepositoryPrs(repo, options),
+      ]);
+      return { ...runs, ...prs };
+    },
+
+    // Synchronous read of whatever is cached (even stale) for an immediate first paint.
+    getCachedRepositoryData(fullName) {
+      const workflowRuns = readStaleCacheEntry(repoCacheKey('runs', fullName), mapRuns);
+      const openPrs = readStaleCacheEntry(repoCacheKey('prs', fullName), mapPrs);
+      if (workflowRuns === undefined && openPrs === undefined) return null;
+
+      const cached = {};
+      if (workflowRuns !== undefined) cached.workflow_runs = workflowRuns;
+      if (openPrs !== undefined) cached.open_prs = openPrs;
+      return cached;
     },
 
     async fetchPrReviews(owner, repo, pullNumber, { prsTtl = 2 * 60 * 1000 } = {}) {
       const reviews = await cachedFetch(
-        `gh-cache-reviews-${owner}/${repo}#${pullNumber}`,
+        `gh-cache-reviews-${owner}/${repo}#${pullNumber}`.toLowerCase(),
         prsTtl,
         async () => {
           const { data } = await octokit.pulls.listReviews({
@@ -356,4 +394,6 @@ export function createDashboardClient(token, octokitOverride) {
       return 'PENDING';
     },
   };
+
+  return client;
 }

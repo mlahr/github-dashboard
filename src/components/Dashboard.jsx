@@ -105,6 +105,19 @@ function compareRepositoriesByLatestRun(a, b) {
 }
 
 const AUTO_POLL_INTERVAL = 15_000;
+const PR_REQUEST_CONCURRENCY = 6;
+
+// Runs worker(item) for every item, with at most `limit` calls at the same time.
+// Items start in array order. worker must handle its own errors.
+async function runWithConcurrency(items, limit, worker) {
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      await worker(items[next++]);
+    }
+  });
+  await Promise.all(lanes);
+}
 
 function hasActiveRuns(repo) {
   return repo.workflow_runs.some(run => run.status !== 'completed');
@@ -173,22 +186,15 @@ export default function Dashboard() {
   const [draftPrsTtl, setDraftPrsTtl] = useState(prsTtl);
   const [refreshCounter, setRefreshCounter] = useState(0);
   const repositoriesRef = useRef(repositories);
-  const matchedRepoCountRef = useRef(matchedRepoCount);
 
   useEffect(() => {
     repositoriesRef.current = repositories;
   }, [repositories]);
 
   useEffect(() => {
-    matchedRepoCountRef.current = matchedRepoCount;
-  }, [matchedRepoCount]);
-
-  useEffect(() => {
     if (!token) return;
 
     let cancelled = false;
-    const hasExistingResults =
-      repositoriesRef.current.length > 0 || matchedRepoCountRef.current > 0;
 
     const patterns = repoPatterns
       .split('\n')
@@ -202,13 +208,10 @@ export default function Dashboard() {
       prsTtl: prsTtl * 60 * 1000,
     };
 
-    setError(null);
-    setDiscoveryWarnings([]);
-    setDiscovering(!hasExistingResults);
-    setRefreshing(hasExistingResults);
-
+    // Spinner/reset state is set by beginReload(), which every trigger of this effect
+    // must call (handleSave, handleRefresh). This effect only follows the fetch lifecycle.
     client.fetchMatchedRepositories(patterns, ttlOptions)
-      .then(({ repositories: matchedRepos, warnings }) => {
+      .then(async ({ repositories: matchedRepos, warnings }) => {
         if (cancelled) return;
 
         setDiscoveryWarnings(warnings);
@@ -222,44 +225,64 @@ export default function Dashboard() {
           return;
         }
 
-        Promise.allSettled(
-          matchedRepos.map(async repo => {
-            try {
-              const result = await client.fetchRepositoryData(repo, ttlOptions);
+        // Paint whatever is cached (even stale) immediately; the phases below overwrite with fresh data.
+        setRepositories(prev => prev.map(current => {
+          const cached = client.getCachedRepositoryData(current.name);
+          return cached
+            ? { ...current, ...cached, loading: false, refreshing: true }
+            : current;
+        }));
 
-              if (cancelled) return;
+        // Phase 1: workflow runs for every repo — drives the recency ranking and status badges.
+        const runsResults = await Promise.allSettled(matchedRepos.map(repo =>
+          client.fetchRepositoryRuns(repo, ttlOptions)
+        ));
 
-              setRepositories(prev => prev.map(current =>
-                current.name === repo.full_name
-                  ? {
-                      ...current,
-                      ...result,
-                      loading: false,
-                      refreshing: false,
-                      error: null,
-                    }
-                  : current
-              ));
-            } catch (err) {
-              if (cancelled) return;
-
-              setRepositories(prev => prev.map(current =>
-                current.name === repo.full_name
-                  ? {
-                      ...current,
-                      loading: false,
-                      refreshing: false,
-                      error: getErrorMessage(err),
-                    }
-                  : current
-              ));
-            }
-          })
-        ).finally(() => {
-          if (!cancelled) {
-            setRefreshing(false);
-          }
+        runsResults.forEach((result, index) => {
+          if (cancelled) return;
+          const repo = matchedRepos[index];
+          setRepositories(prev => prev.map(current =>
+            current.name === repo.full_name
+              ? result.status === 'fulfilled'
+                // refreshing stays on until this repo's open PRs are loaded (phase 2)
+                ? { ...current, ...result.value, loading: false, refreshing: true, error: null }
+                : { ...current, loading: false, refreshing: false, error: getErrorMessage(result.reason) }
+              : current
+          ));
         });
+
+        // Phase 2: open PRs, newest activity first. The request pool starts them in this
+        // order, so the top cards fill first.
+        const withRuns = runsResults
+          .map((result, index) =>
+            result.status === 'fulfilled'
+              ? { repo: matchedRepos[index], runs: result.value.workflow_runs }
+              : null
+          )
+          .filter(Boolean)
+          .sort((a, b) =>
+            (getLatestRunTimestamp({ workflow_runs: b.runs }) || 0) -
+            (getLatestRunTimestamp({ workflow_runs: a.runs }) || 0)
+          );
+
+        await runWithConcurrency(withRuns, PR_REQUEST_CONCURRENCY, async ({ repo }) => {
+          let update;
+          try {
+            update = { ...(await client.fetchRepositoryPrs(repo, ttlOptions)), error: null };
+          } catch (err) {
+            update = { error: `Open PRs: ${getErrorMessage(err)}` };
+          }
+          if (cancelled) return;
+          setRepositories(prev => prev.map(current =>
+            current.name === repo.full_name
+              ? { ...current, ...update, refreshing: false }
+              : current
+          ));
+        });
+
+        if (!cancelled) {
+          setRefreshing(false);
+        }
       })
       .catch(err => {
         if (!cancelled) {
@@ -318,13 +341,24 @@ export default function Dashboard() {
     localStorage.setItem(LS_RUNS_TTL_KEY, draftRunsTtl);
     localStorage.setItem(LS_PRS_TTL_KEY, draftPrsTtl);
     if (draftToken !== token) clearCache();
-    setError(null);
-    setDiscoveryWarnings([]);
+    const settingsChanged =
+      draftToken !== token ||
+      draftPatterns !== repoPatterns ||
+      draftReposTtl !== reposTtl ||
+      draftRunsTtl !== runsTtl ||
+      draftPrsTtl !== prsTtl;
     if (!draftToken) {
+      setError(null);
+      setDiscoveryWarnings([]);
       setRepositories([]);
       setMatchedRepoCount(0);
       setDiscovering(false);
       setRefreshing(false);
+    } else if (settingsChanged) {
+      beginReload();
+    } else {
+      setError(null);
+      setDiscoveryWarnings([]);
     }
     setToken(draftToken);
     setRepoPatterns(draftPatterns);
@@ -334,10 +368,19 @@ export default function Dashboard() {
     setSettingsOpen(false);
   }
 
-  function handleRefresh() {
-    clearCache();
+  // Resets messages and sets the spinner state for a new load.
+  // Every trigger of the load effect must call this function.
+  function beginReload() {
+    const hasExistingResults = repositoriesRef.current.length > 0;
     setError(null);
     setDiscoveryWarnings([]);
+    setDiscovering(!hasExistingResults);
+    setRefreshing(hasExistingResults);
+  }
+
+  function handleRefresh() {
+    clearCache();
+    beginReload();
     setRefreshCounter(c => c + 1);
   }
 

@@ -60,9 +60,8 @@ beforeEach(() => {
 });
 
 describe('repository resolution', () => {
-  it('resolves and caches an exact user-owned repository', async () => {
+  it('resolves exact repositories locally without an API call', async () => {
     const octokit = createOctokit();
-    octokit.repos.get.mockResolvedValue({ data: repository('mlahr/upag') });
     const client = createDashboardClient('token', octokit);
 
     const first = await client.fetchMatchedRepositories(['mlahr/upag']);
@@ -73,8 +72,8 @@ describe('repository resolution', () => {
       warnings: [],
     });
     expect(second).toEqual(first);
-    expect(octokit.repos.get).toHaveBeenCalledTimes(1);
-    expect([...localStorage.values.keys()]).toEqual(['gh-cache-repositories-v2']);
+    expect(octokit.repos.get).not.toHaveBeenCalled();
+    expect(localStorage.getItem('gh-cache-repositories-v2')).toBeNull();
   });
 
   it('matches organization wildcards case-insensitively without matching the base name', async () => {
@@ -150,10 +149,8 @@ describe('repository resolution', () => {
     }]);
   });
 
-  it('returns valid repositories with a targeted warning for a failed pattern', async () => {
+  it('returns exact repositories unvalidated alongside wildcard matches', async () => {
     const octokit = createOctokit();
-    const notFound = Object.assign(new Error('Not Found'), { status: 404 });
-    octokit.repos.get.mockRejectedValue(notFound);
     octokit.users.getByUsername.mockResolvedValue({
       data: { login: 'MenschMachine', type: 'Organization' },
     });
@@ -164,12 +161,12 @@ describe('repository resolution', () => {
     const result = await createDashboardClient('token', octokit)
       .fetchMatchedRepositories(['mlahr/missing', 'MenschMachine/pdfdancer-*']);
 
-    expect(result.repositories).toEqual([repository('MenschMachine/pdfdancer-mcp')]);
-    expect(result.warnings).toEqual([{
-      target: 'mlahr/missing',
-      status: 404,
-      message: 'Not Found',
-    }]);
+    expect(result.repositories).toEqual([
+      repository('mlahr/missing'),
+      repository('MenschMachine/pdfdancer-mcp'),
+    ]);
+    expect(result.warnings).toEqual([]);
+    expect(octokit.repos.get).not.toHaveBeenCalled();
   });
 
   it('warns about malformed patterns without making an API request', async () => {
@@ -188,51 +185,64 @@ describe('repository resolution', () => {
 describe('unified repository cache', () => {
   it('keeps independently cached resolutions in one versioned entry', async () => {
     const octokit = createOctokit();
-    octokit.repos.get.mockImplementation(({ owner, repo }) =>
-      Promise.resolve({ data: repository(`${owner}/${repo}`) })
+    octokit.users.getByUsername.mockImplementation(({ username }) =>
+      Promise.resolve({ data: { login: username, type: 'Organization' } })
+    );
+    octokit.repos.listForOrg.mockImplementation(({ org }) =>
+      Promise.resolve([repository(`${org}/alpha`), repository(`${org}/beta`)])
     );
     const client = createDashboardClient('token', octokit);
 
-    await client.fetchMatchedRepositories(['mlahr/upag']);
-    await client.fetchMatchedRepositories(['octocat/Hello-World']);
+    await client.fetchMatchedRepositories(['alpha/*', 'beta/*']);
 
     const cache = JSON.parse(localStorage.getItem('gh-cache-repositories-v2'));
     expect(Object.keys(cache.entries).sort()).toEqual([
-      'repository:mlahr/upag',
-      'repository:octocat/hello-world',
+      'inventory:organization:alpha',
+      'inventory:organization:beta',
+      'owner:alpha',
+      'owner:beta',
     ]);
   });
 
   it('refreshes only stale resolutions', async () => {
     const octokit = createOctokit();
-    octokit.repos.get.mockImplementation(({ owner, repo }) =>
-      Promise.resolve({ data: repository(`${owner}/${repo}`) })
-    );
+    octokit.users.getByUsername.mockResolvedValue({
+      data: { login: 'MenschMachine', type: 'Organization' },
+    });
+    octokit.repos.listForOrg.mockResolvedValue([
+      repository('MenschMachine/pdfdancer-mcp'),
+    ]);
     const client = createDashboardClient('token', octokit);
 
-    await client.fetchMatchedRepositories(['mlahr/upag', 'octocat/Hello-World']);
+    await client.fetchMatchedRepositories(['MenschMachine/pdfdancer-*']);
     const cache = JSON.parse(localStorage.getItem('gh-cache-repositories-v2'));
-    cache.entries['repository:mlahr/upag'].timestamp = 0;
+    cache.entries['inventory:organization:menschmachine'].timestamp = 0;
     localStorage.setItem('gh-cache-repositories-v2', JSON.stringify(cache));
 
     await client.fetchMatchedRepositories(
-      ['mlahr/upag', 'octocat/Hello-World'],
+      ['MenschMachine/pdfdancer-*'],
       { reposTtl: 60_000 }
     );
 
-    expect(octokit.repos.get).toHaveBeenCalledTimes(3);
-    expect(octokit.repos.get).toHaveBeenCalledWith({ owner: 'mlahr', repo: 'upag' });
+    expect(octokit.users.getByUsername).toHaveBeenCalledTimes(1);
+    expect(octokit.repos.listForOrg).toHaveBeenCalledTimes(2);
   });
 
   it('ignores corrupted cache data and removes legacy repository entries', async () => {
     localStorage.setItem('gh-cache-repositories-v2', '{bad json');
     localStorage.setItem('gh-cache-repos-MenschMachine', '{}');
     const octokit = createOctokit();
-    octokit.repos.get.mockResolvedValue({ data: repository('mlahr/upag') });
+    octokit.users.getByUsername.mockResolvedValue({
+      data: { login: 'MenschMachine', type: 'Organization' },
+    });
+    octokit.repos.listForOrg.mockResolvedValue([
+      repository('MenschMachine/pdfdancer-mcp'),
+    ]);
 
-    await createDashboardClient('token', octokit).fetchMatchedRepositories(['mlahr/upag']);
+    const result = await createDashboardClient('token', octokit)
+      .fetchMatchedRepositories(['MenschMachine/pdfdancer-*']);
 
-    expect(octokit.repos.get).toHaveBeenCalledTimes(1);
+    expect(result.repositories).toEqual([repository('MenschMachine/pdfdancer-mcp')]);
     expect(localStorage.getItem('gh-cache-repos-MenschMachine')).toBeNull();
     expect(JSON.parse(localStorage.getItem('gh-cache-repositories-v2')).version).toBe(2);
   });
@@ -244,5 +254,140 @@ describe('unified repository cache', () => {
     clearCache();
 
     expect(localStorage.length).toBe(0);
+  });
+});
+
+describe('repository data', () => {
+  function createDataOctokit() {
+    const octokit = createOctokit();
+    octokit.actions = {
+      listWorkflowRunsForRepo: vi.fn().mockResolvedValue({
+        data: {
+          workflow_runs: [{
+            id: 1,
+            name: 'CI',
+            conclusion: 'success',
+            status: 'completed',
+            created_at: '2026-01-01T00:00:00Z',
+            html_url: 'https://github.com/runs/1',
+          }],
+        },
+      }),
+    };
+    octokit.pulls = {
+      list: vi.fn().mockResolvedValue({
+        data: [{
+          number: 7,
+          title: 'Fix',
+          user: { login: 'mlahr' },
+          created_at: '2025-12-01T00:00:00Z',
+          updated_at: '2025-12-02T00:00:00Z',
+          html_url: 'https://github.com/prs/7',
+          draft: false,
+          labels: [],
+        }],
+      }),
+    };
+    return octokit;
+  }
+
+  it('merges runs and PRs in fetchRepositoryData and shares one cache per endpoint', async () => {
+    const octokit = createDataOctokit();
+    const client = createDashboardClient('token', octokit);
+    const repo = repository('mlahr/upag');
+
+    await expect(client.fetchRepositoryData(repo)).resolves.toEqual({
+      name: 'mlahr/upag',
+      workflow_runs: [{
+        run_id: 1,
+        name: 'CI',
+        conclusion: 'success',
+        status: 'completed',
+        created_at: '2026-01-01T00:00:00Z',
+        html_url: 'https://github.com/runs/1',
+      }],
+      open_prs: [{
+        number: 7,
+        title: 'Fix',
+        user: 'mlahr',
+        created_at: '2025-12-01T00:00:00Z',
+        updated_at: '2025-12-02T00:00:00Z',
+        html_url: 'https://github.com/prs/7',
+        draft: false,
+        labels: [],
+      }],
+    });
+
+    await client.fetchRepositoryRuns(repo);
+    await client.fetchRepositoryPrs(repo);
+
+    expect(octokit.actions.listWorkflowRunsForRepo).toHaveBeenCalledTimes(1);
+    expect(octokit.pulls.list).toHaveBeenCalledTimes(1);
+    expect([...localStorage.values.keys()].sort()).toEqual([
+      'gh-cache-prs-mlahr/upag',
+      'gh-cache-runs-mlahr/upag',
+    ]);
+  });
+
+  it('reads cached runs and PRs for an immediate first paint, even when stale', async () => {
+    const octokit = createDataOctokit();
+    const client = createDashboardClient('token', octokit);
+
+    await client.fetchRepositoryData(repository('mlahr/upag'));
+
+    const cached = client.getCachedRepositoryData('mlahr/upag');
+    expect(cached.workflow_runs).toHaveLength(1);
+    expect(cached.open_prs).toHaveLength(1);
+    expect(client.getCachedRepositoryData('nobody/nothing')).toBeNull();
+  });
+
+  it('uses one cache entry for names that differ only in letter case', async () => {
+    const octokit = createDataOctokit();
+    const client = createDashboardClient('token', octokit);
+
+    await client.fetchRepositoryData(repository('MLahr/UPAG'));
+    await client.fetchRepositoryData(repository('mlahr/upag'));
+
+    expect(octokit.actions.listWorkflowRunsForRepo).toHaveBeenCalledTimes(1);
+    expect(octokit.pulls.list).toHaveBeenCalledTimes(1);
+    expect(client.getCachedRepositoryData('MLAHR/Upag').workflow_runs).toHaveLength(1);
+  });
+
+  it('removes a bad cache entry and still returns the valid one', async () => {
+    const octokit = createDataOctokit();
+    const client = createDashboardClient('token', octokit);
+    await client.fetchRepositoryData(repository('mlahr/upag'));
+    localStorage.setItem(
+      'gh-cache-runs-mlahr/upag',
+      JSON.stringify({ data: { no_runs_here: true }, timestamp: Date.now() })
+    );
+
+    const cached = client.getCachedRepositoryData('mlahr/upag');
+
+    expect(cached.workflow_runs).toBeUndefined();
+    expect(cached.open_prs).toHaveLength(1);
+    expect(localStorage.getItem('gh-cache-runs-mlahr/upag')).toBeNull();
+  });
+
+  it('works when the methods are used without the client object', async () => {
+    const octokit = createDataOctokit();
+    const { fetchRepositoryData } = createDashboardClient('token', octokit);
+
+    const result = await fetchRepositoryData(repository('mlahr/upag'));
+
+    expect(result.workflow_runs).toHaveLength(1);
+    expect(result.open_prs).toHaveLength(1);
+  });
+
+  it('rejects the runs request for a repository that does not exist', async () => {
+    const octokit = createDataOctokit();
+    octokit.actions.listWorkflowRunsForRepo.mockRejectedValue(
+      Object.assign(new Error('Not Found'), { status: 404 })
+    );
+    const client = createDashboardClient('token', octokit);
+
+    await expect(client.fetchRepositoryRuns(repository('mlahr/missing')))
+      .rejects.toMatchObject({ status: 404 });
+    expect(client.getCachedRepositoryData('mlahr/missing')).toBeNull();
   });
 });
